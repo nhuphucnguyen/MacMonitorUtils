@@ -22,9 +22,12 @@ final class CoreGraphicsDisplayController {
   private var isApplyingConfiguration = false
   private var builtinWasDisabledByThisApp = false
   private var recoveryFailureWasReported = false
+  private var recoveryIsSuspended = false
   private var recoveryCheckGeneration: UInt = 0
+  private var recoveryResumeGeneration: UInt = 0
   private var safetyWatchdog: DispatchSourceTimer?
   private var knownActiveExternalDisplayIDs = Set<CGDirectDisplayID>()
+  private(set) var lastRecoveryErrorDescription: String?
 
   private let frameworkHandle: UnsafeMutableRawPointer?
   private let configureDisplayEnabled: ConfigureDisplayEnabledFunction?
@@ -131,6 +134,7 @@ final class CoreGraphicsDisplayController {
 
     builtinWasDisabledByThisApp = !enabled
     recoveryFailureWasReported = false
+    lastRecoveryErrorDescription = nil
     log("Built-in display was turned \(enabled ? "on" : "off").")
   }
 
@@ -165,6 +169,7 @@ final class CoreGraphicsDisplayController {
 
   func stopMonitoring() {
     recoveryCheckGeneration &+= 1
+    recoveryResumeGeneration &+= 1
     safetyWatchdog?.cancel()
     safetyWatchdog = nil
     if isMonitoring {
@@ -175,6 +180,29 @@ final class CoreGraphicsDisplayController {
     }
     isMonitoring = false
     changeHandler = nil
+  }
+
+  func suspendAutomaticRecovery(reason: String) {
+    recoveryResumeGeneration &+= 1
+    recoveryCheckGeneration &+= 1
+    recoveryIsSuspended = true
+    log("Automatic recovery suspended: \(reason).")
+  }
+
+  func resumeAutomaticRecovery(after delay: TimeInterval, reason: String) {
+    guard recoveryIsSuspended else { return }
+
+    recoveryResumeGeneration &+= 1
+    let generation = recoveryResumeGeneration
+    log("Automatic recovery will resume after \(delay) seconds: \(reason).")
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self, self.recoveryResumeGeneration == generation else { return }
+
+      self.recoveryIsSuspended = false
+      self.log("Automatic recovery resumed: \(reason).")
+      self.safetyWatchdogDidFire()
+    }
   }
 
   private func startSafetyWatchdog() {
@@ -194,7 +222,7 @@ final class CoreGraphicsDisplayController {
   }
 
   private func safetyWatchdogDidFire() {
-    guard !isApplyingConfiguration else { return }
+    guard !isApplyingConfiguration, !recoveryIsSuspended else { return }
 
     let currentSnapshot = snapshot()
     guard shouldAttemptSafetyRestore(for: currentSnapshot) else {
@@ -237,7 +265,10 @@ final class CoreGraphicsDisplayController {
     if displayWasRemoved && removedDisplayWasExternal {
       knownActiveExternalDisplayIDs.remove(displayID)
 
-      if builtinWasDisabledByThisApp && knownActiveExternalDisplayIDs.isEmpty {
+      if !recoveryIsSuspended,
+        builtinWasDisabledByThisApp,
+        knownActiveExternalDisplayIDs.isEmpty
+      {
         // Do this before waiting for WindowServer's active-display list to
         // settle. A Mac with no active outputs can enter display sleep before
         // the watchdog gets its next timer event.
@@ -273,9 +304,11 @@ final class CoreGraphicsDisplayController {
       // claim the panel is active even while WindowServer still has it disabled.
       try setBuiltinDisplayEnabled(true, force: true)
       recoveryFailureWasReported = false
+      lastRecoveryErrorDescription = nil
       log("Safety restore turned the built-in display on.")
       return nil
     } catch {
+      lastRecoveryErrorDescription = error.localizedDescription
       log("Safety restore failed: \(error.localizedDescription)")
       guard !recoveryFailureWasReported else { return nil }
       recoveryFailureWasReported = true
@@ -284,7 +317,8 @@ final class CoreGraphicsDisplayController {
   }
 
   private func shouldAttemptSafetyRestore(for snapshot: DisplaySnapshot) -> Bool {
-    builtinWasDisabledByThisApp
+    !recoveryIsSuspended
+      && builtinWasDisabledByThisApp
       && snapshot.builtinDisplayID != nil
       && snapshot.activeExternalDisplayCount == 0
   }

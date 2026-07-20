@@ -4,6 +4,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let displayController = CoreGraphicsDisplayController()
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
   private let statusMenu = NSMenu()
+  private let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     ProcessInfo.processInfo.disableAutomaticTermination(
@@ -11,17 +12,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     ProcessInfo.processInfo.disableSuddenTermination()
 
+    observeSleepAndWake()
     configureStatusItem()
-    displayController.startMonitoring { [weak self] _, recoveryError in
+    displayController.startMonitoring { [weak self] _, _ in
       guard let self else { return }
       self.refreshStatusIcon()
-
-      if let recoveryError {
-        self.showError(
-          title: "Built-in display recovery failed",
-          error: recoveryError
-        )
-      }
     }
   }
 
@@ -36,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    workspaceNotificationCenter.removeObserver(self)
     displayController.stopMonitoring()
   }
 
@@ -61,6 +57,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   @objc private func quitApplication() {
     NSApp.terminate(nil)
+  }
+
+  @objc private func systemWillSleep(_ notification: Notification) {
+    displayController.suspendAutomaticRecovery(reason: "the Mac is preparing to sleep")
+  }
+
+  @objc private func screenDidSleep(_ notification: Notification) {
+    displayController.suspendAutomaticRecovery(reason: "the screen is asleep")
+  }
+
+  @objc private func sessionDidResignActive(_ notification: Notification) {
+    displayController.suspendAutomaticRecovery(reason: "the login session is inactive")
+  }
+
+  @objc private func systemDidWake(_ notification: Notification) {
+    displayController.resumeAutomaticRecovery(after: 5, reason: "the Mac woke")
+  }
+
+  @objc private func screenDidWake(_ notification: Notification) {
+    displayController.resumeAutomaticRecovery(after: 3, reason: "the screen woke")
+  }
+
+  @objc private func sessionDidBecomeActive(_ notification: Notification) {
+    displayController.resumeAutomaticRecovery(after: 2, reason: "the login session became active")
   }
 
   private func configureStatusItem() {
@@ -139,6 +159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ? "Safety restore is active"
         : "Safety restore is unavailable"
     )
+    if displayController.lastRecoveryErrorDescription != nil {
+      addInformationalItem("Display recovery is retrying automatically", indented: true)
+    }
 
     let quitItem = NSMenuItem(
       title: "Restore Built-in Display and Quit",
@@ -154,6 +177,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     item.isEnabled = false
     item.indentationLevel = indented ? 1 : 0
     statusMenu.addItem(item)
+  }
+
+  private func observeSleepAndWake() {
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(systemWillSleep),
+      name: NSWorkspace.willSleepNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(screenDidSleep),
+      name: NSWorkspace.screensDidSleepNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(sessionDidResignActive),
+      name: NSWorkspace.sessionDidResignActiveNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(systemDidWake),
+      name: NSWorkspace.didWakeNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(screenDidWake),
+      name: NSWorkspace.screensDidWakeNotification,
+      object: nil
+    )
+    workspaceNotificationCenter.addObserver(
+      self,
+      selector: #selector(sessionDidBecomeActive),
+      name: NSWorkspace.sessionDidBecomeActiveNotification,
+      object: nil
+    )
   }
 
   private func showError(title: String, error: Error) {

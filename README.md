@@ -11,6 +11,8 @@ stay open for airflow instead of relying on clamshell mode.
   A one-second safety watchdog runs independently of macOS display callbacks,
   with additional follow-up checks for abrupt cable and dock disconnects.
 - The app opts out of automatic termination so the watchdog remains resident.
+- Recovery pauses during sleep and resumes after WindowServer and the login
+  session have stabilized, avoiding wake-time configuration errors.
 - The built-in display is restored before the app quits.
 - Display changes apply only to the current login session.
 - A recovery-only `--on` command is included; there is deliberately no headless
