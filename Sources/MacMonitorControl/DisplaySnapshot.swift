@@ -9,6 +9,10 @@ struct DisplaySnapshot: Equatable {
     builtinDisplayID != nil && builtinIsActive && activeExternalDisplayCount > 0
   }
 
+  var requiresSafetyRestore: Bool {
+    builtinDisplayID != nil && !builtinIsActive && activeExternalDisplayCount == 0
+  }
+
   var disableBlockReason: String? {
     guard builtinDisplayID != nil else {
       return "No built-in display was found."

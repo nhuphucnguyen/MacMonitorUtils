@@ -96,6 +96,22 @@ enum CommandLineInterface {
           activeExternalDisplayCount: 2
         ).externalDisplaySummary == "2 active external displays"
       ),
+      (
+        "restores an inactive built-in display after the last external disconnects",
+        DisplaySnapshot(
+          builtinDisplayID: 1,
+          builtinIsActive: false,
+          activeExternalDisplayCount: 0
+        ).requiresSafetyRestore
+      ),
+      (
+        "keeps the built-in display off while an external display remains",
+        !DisplaySnapshot(
+          builtinDisplayID: 1,
+          builtinIsActive: false,
+          activeExternalDisplayCount: 1
+        ).requiresSafetyRestore
+      ),
     ]
 
     var failed = false

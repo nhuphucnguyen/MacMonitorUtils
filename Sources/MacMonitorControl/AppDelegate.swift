@@ -6,6 +6,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let statusMenu = NSMenu()
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    ProcessInfo.processInfo.disableAutomaticTermination(
+      "The display safety watchdog must remain active."
+    )
+    ProcessInfo.processInfo.disableSuddenTermination()
+
     configureStatusItem()
     displayController.startMonitoring { [weak self] _, recoveryError in
       guard let self else { return }

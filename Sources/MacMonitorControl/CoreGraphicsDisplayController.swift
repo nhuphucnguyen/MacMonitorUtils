@@ -1,6 +1,7 @@
 import CoreGraphics
 import Darwin
 import Foundation
+import OSLog
 
 final class CoreGraphicsDisplayController {
   typealias ChangeHandler = (_ snapshot: DisplaySnapshot, _ recoveryError: Error?) -> Void
@@ -19,9 +20,18 @@ final class CoreGraphicsDisplayController {
   private var changeHandler: ChangeHandler?
   private var isMonitoring = false
   private var isApplyingConfiguration = false
+  private var builtinWasDisabledByThisApp = false
+  private var recoveryFailureWasReported = false
+  private var recoveryCheckGeneration: UInt = 0
+  private var safetyWatchdog: DispatchSourceTimer?
+  private var knownActiveExternalDisplayIDs = Set<CGDirectDisplayID>()
 
   private let frameworkHandle: UnsafeMutableRawPointer?
   private let configureDisplayEnabled: ConfigureDisplayEnabledFunction?
+  private let logger = Logger(
+    subsystem: "local.mac-monitor-control",
+    category: "DisplayRecovery"
+  )
 
   init() {
     let handle = dlopen(Self.coreGraphicsPath, RTLD_NOW | RTLD_LOCAL)
@@ -51,7 +61,7 @@ final class CoreGraphicsDisplayController {
   }
 
   var isSafetyRestoreActive: Bool {
-    isMonitoring
+    safetyWatchdog != nil
   }
 
   func snapshot() -> DisplaySnapshot {
@@ -62,22 +72,27 @@ final class CoreGraphicsDisplayController {
 
     let activeIDs = activeDisplayIDs()
     let builtinID = knownBuiltinDisplayID
+    let activeExternalIDs = activeIDs.filter { !isBuiltinDisplay($0) }
+    knownActiveExternalDisplayIDs = Set(activeExternalIDs)
 
     return DisplaySnapshot(
       builtinDisplayID: builtinID,
       builtinIsActive: builtinID.map(activeIDs.contains) ?? false,
-      activeExternalDisplayCount: activeIDs.filter { !isBuiltinDisplay($0) }.count
+      activeExternalDisplayCount: activeExternalIDs.count
     )
   }
 
-  func setBuiltinDisplayEnabled(_ enabled: Bool) throws {
+  func setBuiltinDisplayEnabled(_ enabled: Bool, force: Bool = false) throws {
     let currentSnapshot = snapshot()
 
     guard let builtinDisplayID = currentSnapshot.builtinDisplayID else {
       throw DisplayControlError.noBuiltinDisplay
     }
 
-    if currentSnapshot.builtinIsActive == enabled {
+    if !force && currentSnapshot.builtinIsActive == enabled {
+      if enabled {
+        builtinWasDisabledByThisApp = false
+      }
       return
     }
 
@@ -113,12 +128,18 @@ final class CoreGraphicsDisplayController {
     guard completeResult == .success else {
       throw DisplayControlError.completeConfiguration(completeResult)
     }
+
+    builtinWasDisabledByThisApp = !enabled
+    recoveryFailureWasReported = false
+    log("Built-in display was turned \(enabled ? "on" : "off").")
   }
 
   func restoreBuiltinDisplayIfNeeded() throws {
     let currentSnapshot = snapshot()
-    if currentSnapshot.builtinDisplayID != nil && !currentSnapshot.builtinIsActive {
-      try setBuiltinDisplayEnabled(true)
+    if currentSnapshot.builtinDisplayID != nil
+      && (builtinWasDisabledByThisApp || !currentSnapshot.builtinIsActive)
+    {
+      try setBuiltinDisplayEnabled(true, force: builtinWasDisabledByThisApp)
     }
   }
 
@@ -133,13 +154,19 @@ final class CoreGraphicsDisplayController {
     )
 
     isMonitoring = result == .success
-    if !isMonitoring {
-      self.changeHandler = nil
-    }
-    return isMonitoring
+    startSafetyWatchdog()
+    log(
+      isMonitoring
+        ? "Display callback and safety watchdog are active."
+        : "Display callback registration failed; safety watchdog is active."
+    )
+    return isSafetyRestoreActive
   }
 
   func stopMonitoring() {
+    recoveryCheckGeneration &+= 1
+    safetyWatchdog?.cancel()
+    safetyWatchdog = nil
     if isMonitoring {
       CGDisplayRemoveReconfigurationCallback(
         displayReconfigurationCallback,
@@ -150,24 +177,116 @@ final class CoreGraphicsDisplayController {
     changeHandler = nil
   }
 
+  private func startSafetyWatchdog() {
+    guard safetyWatchdog == nil else { return }
+
+    let watchdog = DispatchSource.makeTimerSource(queue: .main)
+    watchdog.schedule(
+      deadline: .now() + 1,
+      repeating: 1,
+      leeway: .milliseconds(200)
+    )
+    watchdog.setEventHandler { [weak self] in
+      self?.safetyWatchdogDidFire()
+    }
+    safetyWatchdog = watchdog
+    watchdog.resume()
+  }
+
+  private func safetyWatchdogDidFire() {
+    guard !isApplyingConfiguration else { return }
+
+    let currentSnapshot = snapshot()
+    guard shouldAttemptSafetyRestore(for: currentSnapshot) else {
+      recoveryFailureWasReported = false
+      return
+    }
+
+    log("Safety watchdog detected that no external display remains.")
+    let recoveryError = attemptSafetyRestore()
+    changeHandler?(snapshot(), recoveryError)
+  }
+
+  fileprivate func scheduleDisplayConfigurationChecks() {
+    guard isMonitoring else { return }
+
+    recoveryCheckGeneration &+= 1
+    let generation = recoveryCheckGeneration
+
+    // Display removal is asynchronous inside WindowServer. Check more than once
+    // so a dock or cable disconnect is still caught if the first snapshot is stale.
+    for delay in [0.15, 0.75, 2.0] {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        guard let self,
+          self.isMonitoring,
+          self.recoveryCheckGeneration == generation
+        else { return }
+
+        self.displayConfigurationDidChange()
+      }
+    }
+  }
+
+  fileprivate func displayWasReconfigured(
+    displayID: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags
+  ) {
+    let displayWasRemoved = flags.rawValue & (1 << 5) != 0
+    let removedDisplayWasExternal = displayID != knownBuiltinDisplayID
+
+    if displayWasRemoved && removedDisplayWasExternal {
+      knownActiveExternalDisplayIDs.remove(displayID)
+
+      if builtinWasDisabledByThisApp && knownActiveExternalDisplayIDs.isEmpty {
+        // Do this before waiting for WindowServer's active-display list to
+        // settle. A Mac with no active outputs can enter display sleep before
+        // the watchdog gets its next timer event.
+        log("The last known external display was removed; restoring immediately.")
+        let recoveryError = attemptSafetyRestore()
+        changeHandler?(snapshot(), recoveryError)
+      }
+    }
+
+    scheduleDisplayConfigurationChecks()
+  }
+
   fileprivate func displayConfigurationDidChange() {
     guard !isApplyingConfiguration else { return }
 
     let currentSnapshot = snapshot()
-    var recoveryError: Error?
+    let recoveryError: Error?
 
-    if currentSnapshot.builtinDisplayID != nil,
-      !currentSnapshot.builtinIsActive,
-      currentSnapshot.activeExternalDisplayCount == 0
-    {
-      do {
-        try setBuiltinDisplayEnabled(true)
-      } catch {
-        recoveryError = error
-      }
+    if shouldAttemptSafetyRestore(for: currentSnapshot) {
+      log("Display callback detected that no external display remains.")
+      recoveryError = attemptSafetyRestore()
+    } else {
+      recoveryFailureWasReported = false
+      recoveryError = nil
     }
 
     changeHandler?(snapshot(), recoveryError)
+  }
+
+  private func attemptSafetyRestore() -> Error? {
+    do {
+      // Force the private enable call because CGGetActiveDisplayList can briefly
+      // claim the panel is active even while WindowServer still has it disabled.
+      try setBuiltinDisplayEnabled(true, force: true)
+      recoveryFailureWasReported = false
+      log("Safety restore turned the built-in display on.")
+      return nil
+    } catch {
+      log("Safety restore failed: \(error.localizedDescription)")
+      guard !recoveryFailureWasReported else { return nil }
+      recoveryFailureWasReported = true
+      return error
+    }
+  }
+
+  private func shouldAttemptSafetyRestore(for snapshot: DisplaySnapshot) -> Bool {
+    builtinWasDisabledByThisApp
+      && snapshot.builtinDisplayID != nil
+      && snapshot.activeExternalDisplayCount == 0
   }
 
   private func activeDisplayIDs() -> [CGDirectDisplayID] {
@@ -202,6 +321,10 @@ final class CoreGraphicsDisplayController {
   private func isBuiltinDisplay(_ displayID: CGDirectDisplayID) -> Bool {
     CGDisplayIsBuiltin(displayID) != 0
   }
+
+  private func log(_ message: String) {
+    logger.notice("\(message, privacy: .public)")
+  }
 }
 
 private func displayReconfigurationCallback(
@@ -214,7 +337,7 @@ private func displayReconfigurationCallback(
     .fromOpaque(userInfo)
     .takeUnretainedValue()
 
-  DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-    controller.displayConfigurationDidChange()
+  DispatchQueue.main.async {
+    controller.displayWasReconfigured(displayID: displayID, flags: flags)
   }
 }
