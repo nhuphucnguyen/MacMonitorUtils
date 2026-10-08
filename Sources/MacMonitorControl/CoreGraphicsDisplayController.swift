@@ -16,6 +16,12 @@ final class CoreGraphicsDisplayController {
   private static let coreGraphicsPath =
     "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
 
+  /// Upper bound for how long automatic recovery may stay suspended while no
+  /// display is usable. Sleep/wake deferrals only need a few seconds; beyond
+  /// this the suspension is treated as wedged (e.g. no wake event arrived
+  /// after an unplug-triggered display sleep) and recovery proceeds anyway.
+  private static let maxRecoverySuspensionInterval: TimeInterval = 10
+
   private var knownBuiltinDisplayID: CGDirectDisplayID?
   private var changeHandler: ChangeHandler?
   private var isMonitoring = false
@@ -23,6 +29,7 @@ final class CoreGraphicsDisplayController {
   private var builtinWasDisabledByThisApp = false
   private var recoveryFailureWasReported = false
   private var recoveryIsSuspended = false
+  private var recoverySuspendedAt: Date?
   private var recoveryCheckGeneration: UInt = 0
   private var recoveryResumeGeneration: UInt = 0
   private var safetyWatchdog: DispatchSourceTimer?
@@ -183,9 +190,23 @@ final class CoreGraphicsDisplayController {
   }
 
   func suspendAutomaticRecovery(reason: String) {
+    // Never suspend while no display is usable at all. A suspension that wins
+    // the race against an unplug-triggered display sleep would cancel the
+    // in-flight restore retries and block the watchdog, with no wake event
+    // guaranteed to resume it -- leaving the Mac with no active display.
+    if !isApplyingConfiguration, snapshot().requiresSafetyRestore {
+      log(
+        "Skipping recovery suspension (\(reason)): no active display remains; attempting emergency restore."
+      )
+      let recoveryError = attemptSafetyRestore()
+      changeHandler?(snapshot(), recoveryError)
+      return
+    }
+
     recoveryResumeGeneration &+= 1
     recoveryCheckGeneration &+= 1
     recoveryIsSuspended = true
+    recoverySuspendedAt = Date()
     log("Automatic recovery suspended: \(reason).")
   }
 
@@ -200,6 +221,7 @@ final class CoreGraphicsDisplayController {
       guard let self, self.recoveryResumeGeneration == generation else { return }
 
       self.recoveryIsSuspended = false
+      self.recoverySuspendedAt = nil
       self.log("Automatic recovery resumed: \(reason).")
       self.safetyWatchdogDidFire()
     }
@@ -222,7 +244,23 @@ final class CoreGraphicsDisplayController {
   }
 
   private func safetyWatchdogDidFire() {
-    guard !isApplyingConfiguration, !recoveryIsSuspended else { return }
+    guard !isApplyingConfiguration else { return }
+
+    if recoveryIsSuspended {
+      // A suspension must never wedge recovery forever. If the grace period
+      // expires while no display is usable (e.g. no wake event arrived after
+      // an unplug-triggered display sleep), restore anyway.
+      guard let suspendedAt = recoverySuspendedAt,
+        Date().timeIntervalSince(suspendedAt) >= Self.maxRecoverySuspensionInterval,
+        snapshot().requiresSafetyRestore
+      else { return }
+
+      log(
+        "Recovery suspension exceeded its grace period with no active display; attempting emergency restore."
+      )
+      recoveryIsSuspended = false
+      recoverySuspendedAt = nil
+    }
 
     let currentSnapshot = snapshot()
     guard shouldAttemptSafetyRestore(for: currentSnapshot) else {
